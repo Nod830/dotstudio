@@ -335,6 +335,24 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  // 다른 AI 도구의 MCP 서버(peer)가 이 서버를 거쳐 브라우저에 명령을 보내는 길. 브라우저 페이지는 쓸 수 없다.
+  if (url.pathname.startsWith('/mcp/') && req.headers['x-dotstudio-peer'] === '1' && !origin) {
+    if (url.pathname === '/mcp/status') return sendJson(res, { dotstudio: true, browser: browserConnected() });
+    if (url.pathname === '/mcp/exec' && req.method === 'POST') {
+      const chunks = [];
+      let size = 0;
+      req.on('data', c => { size += c.length; if (size > 80e6) req.destroy(); else chunks.push(c); });
+      req.on('end', async () => {
+        try {
+          const { name, args } = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+          if (!TOOL_NAMES.has(name)) throw new Error('모르는 도구: ' + name);
+          sendJson(res, await sendToBrowser(name, args || {}));
+        } catch (e) { sendJson(res, { ok: false, error: e.message }); }
+      });
+      return;
+    }
+  }
+
   if (url.pathname === '/mcp/result' && req.method === 'POST') {
     const chunks = [];
     let size = 0;
@@ -367,14 +385,69 @@ function sendJson(res, obj) {
   res.end(JSON.stringify(obj));
 }
 
+// 역할: hub(포트를 연 서버, 브라우저와 직접 연결) · peer(이미 열린 다른 서버를 거쳐 감) · blocked(다른 프로그램이 포트를 씀)
+// AI 도구를 여러 개 켜도 먼저 켠 쪽이 hub가 되고 나머지는 peer가 되어 같은 도트공방을 함께 쓴다.
+let role = 'starting';
+let tookOver = false; // 이어받은 직후에는 브라우저가 다시 붙을 때까지 기다린다
 let listenError = null;
-server.on('error', e => {
-  listenError = e.code === 'EADDRINUSE'
-    ? `포트 ${PORT}을(를) 이미 다른 프로그램이 쓰고 있어요. 다른 AI 도구가 도트공방 MCP를 먼저 켰을 수 있어요. 그쪽을 끄거나 DOTSTUDIO_MCP_PORT 환경 변수로 포트를 바꾸세요.`
-    : String(e.message);
+const hubUrl = p => `http://127.0.0.1:${PORT}${p}`;
+
+function listen() {
+  return new Promise(resolve => {
+    const onErr = e => { server.off('listening', onOk); resolve(e); };
+    const onOk = () => { server.off('error', onErr); role = 'hub'; resolve(null); };
+    server.once('error', onErr);
+    server.once('listening', onOk);
+    server.listen(PORT, '127.0.0.1');
+  });
+}
+
+async function hubFetch(p, body) {
+  const res = await fetch(hubUrl(p), {
+    method: body ? 'POST' : 'GET',
+    headers: { 'x-dotstudio-peer': '1', 'Content-Type': 'application/json' },
+    body: body ? JSON.stringify(body) : undefined,
+    signal: AbortSignal.timeout(70000),
+  });
+  return res.json();
+}
+
+const ready = listen().then(async err => {
+  if (!err) return log(`도트공방: ${APP_URL}`);
+  if (err.code === 'EADDRINUSE') {
+    try {
+      if ((await hubFetch('/mcp/status')).dotstudio) {
+        role = 'peer';
+        return log(`포트 ${PORT}을(를) 쓰는 다른 도트공방 서버에 연결해서 함께 써요`);
+      }
+    } catch { /* 도트공방 서버가 아님 */ }
+    listenError = `포트 ${PORT}을(를) 도트공방이 아닌 다른 프로그램이 쓰고 있어요. 그 프로그램을 끄거나 DOTSTUDIO_MCP_PORT 환경 변수로 포트를 바꾸세요.`;
+  } else listenError = String(err.message);
+  role = 'blocked';
   log(listenError);
 });
-server.listen(PORT, '127.0.0.1', () => log(`도트공방: ${APP_URL}`));
+
+// 브라우저에 명령 하나를 보낸다. { connected: false }면 브라우저에 도트공방이 없다는 뜻.
+async function runInBrowser(name, payload) {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    if (role === 'peer') {
+      try {
+        if (!(await hubFetch('/mcp/status')).browser) return { connected: false };
+        return { connected: true, reply: await hubFetch('/mcp/exec', { name, args: payload }) };
+      } catch {
+        // hub였던 AI 도구가 꺼졌다 → 내가 포트를 이어받는다
+        if (!(await listen())) tookOver = true; // 실패하면 다른 peer가 먼저 이어받은 것이니 다시 시도
+      }
+    }
+    if (role === 'hub') {
+      // 이어받은 직후라면 브라우저가 다시 붙을 시간을 준다 (브라우저는 연결이 끊기면 몇 초 간격으로 다시 시도한다)
+      for (let i = 0; tookOver && !browserConnected() && i < 60; i++) await new Promise(r => setTimeout(r, 200));
+      if (!browserConnected()) return { connected: false };
+      return { connected: true, reply: await sendToBrowser(name, payload) };
+    }
+  }
+  throw new Error('도트공방 서버에 연결하지 못했어요. 잠시 뒤 다시 시도하세요.');
+}
 
 // ---------- 파일 도우미 ----------
 const resolvePath = p => path.resolve(process.cwd(), p);
@@ -396,6 +469,7 @@ function writeOut(base, ext, base64) {
 async function callTool(name, args) {
   if (!TOOL_NAMES.has(name)) throw Object.assign(new Error(`Unknown tool: ${name}`), { code: -32602 });
   const fail = text => ({ content: [{ type: 'text', text }], isError: true });
+  await ready;
   if (listenError) return fail(listenError);
 
   // 디스크 파일은 서버가 읽어서 브라우저로 넘긴다
@@ -408,12 +482,12 @@ async function callTool(name, args) {
     }
   } catch (e) { return fail(e.message); }
 
-  if (!browserConnected()) {
+  let run;
+  try { run = await runInBrowser(name, payload); } catch (e) { return fail(e.message); }
+  if (!run.connected) {
     return fail(`도트공방이 브라우저에 열려 있지 않아요. 사용자에게 ${APP_URL} 을 브라우저로 열어 달라고 요청하세요.`);
   }
-
-  let reply;
-  try { reply = await sendToBrowser(name, payload); } catch (e) { return fail(e.message); }
+  const reply = run.reply;
   if (!reply.ok) return fail(reply.error || '실패했어요.');
 
   const content = [];
